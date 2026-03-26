@@ -3462,6 +3462,796 @@ merge_tokens(char **argv)
 
 	exit(0);
 }
+static int api_identifiers(FILE *of, void *)
+{
+    fprintf(of, "Content-Type: application/json\r\n\r\n");
+
+    bool filter_readonly = swill_getvar("readonly") != NULL;
+    bool filter_unused   = swill_getvar("unused")   != NULL;
+    bool filter_macro    = swill_getvar("macro")    != NULL;
+
+    fprintf(of, "[\n");
+    bool first = true;
+
+    for (IdProp::iterator i = ids.begin(); i != ids.end(); ++i)
+    {
+        Eclass *ec = i->first;
+        Identifier &id = i->second;
+
+      
+
+        if (filter_readonly && !ec->get_attribute(is_readonly))
+            continue;
+
+        if (filter_unused && !ec->is_unused())
+            continue;
+
+        if (filter_macro && !ec->get_attribute(is_macro))
+            continue;
+
+      
+
+        if (!first)
+            fprintf(of, ",\n");
+
+        first = false;
+
+      
+        bool is_macro_flag     = ec->get_attribute(is_macro);
+        bool is_readonly_flag  = ec->get_attribute(is_readonly);
+        bool is_unused_flag    = ec->is_unused();
+
+      
+        bool is_function_flag  = ec->get_attribute(is_cfunction);
+        bool is_typedef_flag   = ec->get_attribute(is_typedef);
+        bool is_struct_flag    = ec->get_attribute(is_suetag);
+        bool is_member_flag    = ec->get_attribute(is_sumember);
+        bool is_variable_flag  = ec->get_attribute(is_ordinary);
+
+        bool is_file_spanning = false;
+
+       
+
+        const char *type = "variable";
+
+        if (is_macro_flag) {
+            type = "macro";
+        }
+        else if (is_function_flag) {
+            type = "function";
+        }
+        else if (is_typedef_flag) {
+            type = "typedef";
+        }
+        else if (is_struct_flag) {
+            type = "struct";
+        }
+        else if (is_member_flag) {
+            type = "struct_member";
+        }
+        else if (is_variable_flag) {
+            type = "variable";
+        }
+
+
+       fprintf(of,
+    "  {"
+    "\"id\":\"%p\","
+    "\"name\":\"%s\","
+    "\"type\":\"%s\","
+    "\"macro\":%s,"
+    "\"readonly\":%s,"
+    "\"unused\":%s,"
+    "\"fileSpanning\":%s"
+    "}",
+    (void*)ec,   
+    id.get_id().c_str(),
+    type,
+    is_macro_flag ? "true" : "false",
+    is_readonly_flag ? "true" : "false",
+    is_unused_flag ? "true" : "false",
+    is_file_spanning ? "true" : "false"
+);
+    }
+
+    fprintf(of, "\n]\n");
+
+    return 0;
+}
+
+static int api_identifier_detail(FILE *fo, void *)
+{
+    swill_setheader("content-type", "application/json");
+
+    Eclass *e;
+
+    if (!swill_getargs("p(id)", &e)) {
+        fprintf(fo, "{\"error\":\"missing id\"}");
+        return 0;
+    }
+
+    IdProp::iterator it = ids.find(e);
+
+    if (it == ids.end()) {
+        fprintf(fo, "{\"error\":\"identifier not registered\"}");
+        return 0;
+    }
+
+    Identifier &id = it->second;
+fprintf(stderr, "ids map size = %lu\n", ids.size());
+    fprintf(fo, "{\n");
+    fprintf(fo, "  \"name\": \"%s\",\n", id.get_id().c_str());
+    fprintf(fo, "  \"cross_file\": %s,\n", id.get_xfile() ? "true" : "false");
+    fprintf(fo, "  \"unused\": %s,\n", e->is_unused() ? "true" : "false");
+    fprintf(fo, "  \"occurrences\": %d\n", e->get_size());
+    fprintf(fo, "}\n");
+
+    return 0;
+}
+int offset_to_line(const string &file, long offset) {
+    FILE *fp = fopen(file.c_str(), "r");
+    if (!fp) return -1;
+
+    int line = 1;
+    long count = 0;
+    int c;
+
+    while ((c = fgetc(fp)) != EOF && count < offset) {
+        if (c == '\n') line++;
+        count++;
+    }
+
+    fclose(fp);
+    return line;
+}
+static int api_identifier_locations(FILE *fo, void *)
+{
+    fprintf(fo, "Content-Type: application/json\r\n\r\n");
+
+    const char *id_str = swill_getvar("id");
+
+    if (!id_str) {
+        fprintf(fo, "{\"error\":\"missing id\"}");
+        return 0;
+    }
+
+    Eclass *e = NULL;
+    sscanf(id_str, "%p", (void**)&e);
+
+    if (!e) {
+        fprintf(fo, "{\"error\":\"invalid pointer\"}");
+        return 0;
+    }
+
+    fprintf(fo, "[\n");
+
+    bool first = true;
+
+    const setTokid &members = e->get_members();
+
+    for (setTokid::const_iterator it = members.begin(); it != members.end(); ++it) {
+
+        const Tokid &t = *it;
+
+    
+        const string &file = t.get_path();
+
+       
+     long pos = (long)t.get_streampos();
+     int line = offset_to_line(file, pos);
+
+        if (!first)
+            fprintf(fo, ",\n");
+
+        first = false;
+
+		fprintf(fo,
+		"  {\"file\":\"%s\",\"offset\":%ld,\"line\":%d}",
+		file.c_str(),
+		pos,
+		line
+	);
+    }
+
+    fprintf(fo, "\n]\n");
+
+    return 0;
+}
+
+static int api_files_handler(FILE *of, void *) {
+    Timer timer;
+
+   
+fprintf(of, "HTTP/1.1 200 OK\r\n");
+fprintf(of, "Content-Type: application/json\r\n");
+fprintf(of, "Connection: close\r\n");
+fprintf(of, "\r\n");
+    FileQuery query(of, Option::file_icase->get(), current_project);
+
+    if (!query.is_valid()) {
+        fprintf(of, "{ \"error\": \"Invalid query\" }");
+        return 0;
+    }
+
+    multiset<Fileid, FileQuery::specified_order> sorted_files;
+
+    for (vector<Fileid>::iterator i = files.begin(); i != files.end(); i++) {
+        if (query.eval(*i)) {
+            sorted_files.insert(*i);
+        }
+    }
+
+    fprintf(of, "{ \"files\": [");
+
+    bool first = true;
+
+    for (auto i = sorted_files.begin(); i != sorted_files.end(); i++) {
+        Fileid f = *i;
+
+        if (current_project && !Filedetails::get_attribute(f, current_project))
+            continue;
+
+        if (!first) fprintf(of, ",");
+        first = false;
+
+        const FileMetrics &m = Filedetails::get_pre_cpp_const_metrics(f);
+
+		fprintf(of,
+		"{"
+		"\"id\": %u,"
+		"\"path\": \"%s\","
+
+		"\"lines\": %g,"
+		"\"tokens\": %g,"
+		"\"cppDirectives\": %g,"
+
+		"\"functions\": %d,"
+		"\"fileScopedFunctions\": %d,"
+		"\"variables\": %d,"
+		"\"fileScopedVariables\": %d,"
+		"\"includes\": %d,"
+
+		"\"statements\": %d,"
+		"\"ifCount\": %d,"
+		"\"loopCount\": %d"
+
+		"}",
+            f.get_id(),
+            f.get_path().c_str(),
+
+           
+            m.get_metric(Metrics::em_nline),
+            m.get_metric(Metrics::em_ntoken),
+            m.get_metric(Metrics::em_nppdirective),
+
+           
+            m.get_int_metric(FileMetrics::em_npfunction),
+            m.get_int_metric(FileMetrics::em_nffunction),
+            m.get_int_metric(FileMetrics::em_npvar),
+            m.get_int_metric(FileMetrics::em_nfvar),
+            m.get_int_metric(FileMetrics::em_nincfile),
+			m.get_int_metric(FileMetrics::em_nstmt),
+			m.get_int_metric(FileMetrics::em_nif),
+			m.get_int_metric(FileMetrics::em_nfor)// loops
+        );
+    }
+
+    fprintf(of, "] }");
+
+    return 0;
+}
+
+static int api_file_includes(FILE *of, void *)
+{
+    fprintf(of, "Content-Type: application/json\r\n\r\n");
+
+    const char *id_str = swill_getvar("id");
+
+    if (!id_str) {
+        fprintf(of, "{\"error\":\"missing id\"}");
+        return 0;
+    }
+
+    int id = atoi(id_str);
+    Fileid f(id);
+
+    bool writable = !!swill_getvar("writable");
+    bool direct = !!swill_getvar("direct");
+    bool unused = !!swill_getvar("unused");
+    bool used = !!swill_getvar("used");
+    bool includes = !!swill_getvar("includes"); 
+
+    const FileIncMap &m = includes
+        ? Filedetails::get_includes(f)
+        : Filedetails::get_includers(f);
+
+    fprintf(of, "[\n");
+
+    bool first = true;
+
+    for (FileIncMap::const_iterator i = m.begin(); i != m.end(); i++) {
+
+        Fileid f2 = (*i).first;
+        const IncDetails &inc = (*i).second;
+
+        //   SAME FILTER LOGIC
+        if ((!writable || !f2.get_readonly()) &&
+            (!direct || inc.is_directly_included()) &&
+            (!used || inc.is_required()) &&
+            (!unused || !inc.is_required())) {
+
+            if (!first)
+                fprintf(of, ",\n");
+
+            first = false;
+
+            fprintf(of,
+                "  {\"file\":\"%s\", \"fileid\":%d, \"direct\":%s, \"writable\":%s, \"unused\":%s}",
+                f2.get_path().c_str(),
+                f2.get_id(),
+                inc.is_directly_included() ? "true" : "false",
+                f2.get_readonly() ? "false" : "true",
+                inc.is_required() ? "false" : "true"
+            );
+        }
+    }
+
+    fprintf(of, "\n]\n");
+    return 0;
+}
+
+static int api_file_dependencies(FILE *of, void *)
+{
+    fprintf(of, "Content-Type: application/json\r\n\r\n");
+
+    const char *id_str = swill_getvar("id");
+    const char *gtype = swill_getvar("type");   // C / F / G
+    const char *dir = swill_getvar("dir");      // D / U
+    const char *filter = swill_getvar("filter"); // writable / all
+
+    // DEBUG LOGS
+    fprintf(stderr, "api_file_dependencies called\n");
+    fprintf(stderr, "id: %s\n", id_str ? id_str : "NULL");
+    fprintf(stderr, "type: %s\n", gtype ? gtype : "NULL");
+    fprintf(stderr, "dir: %s\n", dir ? dir : "NULL");
+    fprintf(stderr, "filter: %s\n", filter ? filter : "NULL");
+
+    if (!id_str || !gtype) {
+        fprintf(of, "{\"error\":\"missing parameters\"}");
+        return 0;
+    }
+
+    int id = atoi(id_str);
+    Fileid target(id);
+
+    bool include_all = (filter && string(filter) == "all");
+
+    set<string> outgoing;
+    set<string> incoming;
+
+    for (vector<Fileid>::iterator i = files.begin(); i != files.end(); i++) {
+
+        if (!include_all && i->get_readonly())
+            continue;
+
+        Fileid current = *i;
+        if (*gtype == 'C') {
+
+            const FileIncMap &m = Filedetails::get_includes(current);
+
+            for (FileIncMap::const_iterator j = m.begin(); j != m.end(); j++) {
+
+                Fileid other = j->first;
+                const IncDetails &details = j->second;
+
+                if (!details.is_required())
+                    continue;
+
+                if (!include_all && other.get_readonly())
+                    continue;
+
+                // current → other
+                if (current == target)
+                    outgoing.insert(other.get_fname());
+
+                if (other == target)
+                    incoming.insert(current.get_fname());
+            }
+        }
+
+        else if (*gtype == 'F') {
+
+            int size = Fileid::max_id() + 1;
+            vector<vector<bool>> edges(size, vector<bool>(size, false));
+
+            Filedetails::clear_all_visited();
+
+            visit_fcall_files(current,
+                (*dir == 'D') ? &Call::call_begin : &Call::caller_begin,
+                (*dir == 'D') ? &Call::call_end   : &Call::caller_end,
+                Option::cgraph_depth->get(),
+                edges
+            );
+
+            for (int j = 0; j < size; j++) {
+
+                if (!edges[current.get_id()][j])
+                    continue;
+
+                Fileid other(j);
+
+                if (!include_all && other.get_readonly())
+                    continue;
+
+                if (current == target)
+                    outgoing.insert(other.get_fname());
+
+                if (other == target)
+                    incoming.insert(current.get_fname());
+            }
+        }
+
+        else if (*gtype == 'G') {
+
+            const Fileidset &uses = Filedetails::get_glob_uses(current);
+
+            for (Fileidset::const_iterator j = uses.begin(); j != uses.end(); j++) {
+
+                Fileid other = *j;
+
+                if (!include_all && other.get_readonly())
+                    continue;
+
+                if (current == target)
+                    outgoing.insert(other.get_fname());
+
+                if (other == target)
+                    incoming.insert(current.get_fname());
+            }
+        }
+    }
+
+    set<string> bidirectional;
+
+    for (const auto &f : outgoing) {
+        if (incoming.find(f) != incoming.end())
+            bidirectional.insert(f);
+    }
+
+    fprintf(of, "{\n");
+
+    fprintf(of, "\"file\":\"%s\",\n", target.get_fname().c_str());
+
+    // OUTGOING
+    fprintf(of, "\"outgoing\":[");
+    bool first = true;
+    for (const auto &f : outgoing) {
+        if (!first) fprintf(of, ",");
+        first = false;
+        fprintf(of, "\"%s\"", f.c_str());
+    }
+    fprintf(of, "],\n");
+
+    // INCOMING
+    fprintf(of, "\"incoming\":[");
+    first = true;
+    for (const auto &f : incoming) {
+        if (!first) fprintf(of, ",");
+        first = false;
+        fprintf(of, "\"%s\"", f.c_str());
+    }
+    fprintf(of, "],\n");
+
+    // BIDIRECTIONAL
+    fprintf(of, "\"bidirectional\":[");
+    first = true;
+    for (const auto &f : bidirectional) {
+        if (!first) fprintf(of, ",");
+        first = false;
+        fprintf(of, "\"%s\"", f.c_str());
+    }
+    fprintf(of, "]\n");
+
+    fprintf(of, "}\n");
+
+    return 0;
+}
+
+
+static int api_functions(FILE *of, void *)
+{
+    fprintf(of, "Content-Type: application/json\r\n\r\n");
+
+    const char *id_str = swill_getvar("id");
+
+    Eclass *e = NULL;
+    set<Call *> funcs;
+
+    //   MODE 1: Identifier → functions
+    if (id_str) {
+        sscanf(id_str, "%p", (void**)&e);
+
+        if (!e) {
+            fprintf(of, "[]");
+            return 0;
+        }
+
+        funcs = e->functions();
+
+        fprintf(of, "[\n");
+        bool first = true;
+
+        for (auto it = funcs.begin(); it != funcs.end(); ++it) {
+            Call *call = *it;
+
+            if (!first) fprintf(of, ",\n");
+            first = false;
+
+       Tokid t = call->get_site();
+
+		string file = t.get_path();
+		long pos = (long)t.get_streampos();
+		int line = offset_to_line(file, pos);
+
+		fprintf(of,
+		"  {\"function\":\"%s\", \"id\":\"%p\", \"file\":\"%s\", \"line\":%d}",
+		call->get_name().c_str(),
+		call,
+		file.c_str(),
+		line);
+
+        }
+
+        fprintf(of, "\n]\n");
+        return 0;
+    }
+
+    //   MODE 2: GLOBAL FUNCTION QUERY (FunQuery powered)
+    FunQuery query(of, Option::file_icase->get(), current_project);
+
+    if (!query.is_valid()) {
+        fprintf(of, "[]");
+        return 0;
+    }
+
+    fprintf(of, "[\n");
+    bool first = true;
+
+    for (Call::const_fmap_iterator_type i = Call::fbegin(); i != Call::fend(); i++) {
+
+        Call *call = i->second;
+
+        if (!query.eval(call))
+            continue;
+
+        if (!first) fprintf(of, ",\n");
+        first = false;
+		Tokid t = call->get_site();
+
+		string file = t.get_path();
+		long pos = (long)t.get_streampos();
+
+		int line = -1;
+		if (!file.empty()) {
+			line = offset_to_line(file, pos);
+		}
+
+		fprintf(of,
+	"  {\"function\":\"%s\", \"id\":\"%p\", \"file\":\"%s\", \"line\":%d}",
+	call->get_name().c_str(),
+	call,
+	file.c_str(),
+	line);
+    }
+
+    fprintf(of, "\n]\n");
+    return 0;
+}
+
+
+static void safe_collect_children(
+    FILE *fo,
+    Call *f,
+    Call::const_fiterator_type (Call::*begin)() const,
+    Call::const_fiterator_type (Call::*end)() const,
+    char type
+) {
+    bool first = true;
+
+    for (auto it = (f->*begin)(); it != (f->*end)(); ++it) {
+
+        Call *child = *it;
+        if (!child) continue;
+        if (child == f) continue;
+        const char *name = nullptr;
+        if (child->get_name().empty()) continue;
+        name = child->get_name().c_str();
+
+        bool hasChildren = false;
+
+        if (type == 'd') {
+            hasChildren = (child->get_num_call() > 0);
+        } else {
+            hasChildren = (child->get_num_caller() > 0);
+        }
+
+        if (!first) fprintf(fo, ",");
+        first = false;
+
+        fprintf(fo, "{");
+        fprintf(fo, "\"id\":\"%p\",", (void*)child);
+        fprintf(fo, "\"name\":\"%s\",", name);
+        fprintf(fo, "\"hasChildren\":%s", hasChildren ? "true" : "false");
+        fprintf(fo, "}");
+    }
+}
+
+void getFunctionRelationsJson(FILE *fo, Call *f, char type) {
+
+    if (!f) {
+        fprintf(fo, "{ \"error\": \"Invalid function\" }");
+        return;
+    }
+
+
+    Call::clear_visit_flags();
+
+    Call::const_fiterator_type (Call::*begin)() const;
+    Call::const_fiterator_type (Call::*end)() const;
+
+    if (type == 'd') {
+        begin = &Call::call_begin;
+        end = &Call::call_end;
+    } else {
+        begin = &Call::caller_begin;
+        end = &Call::caller_end;
+    }
+
+ 
+    if (f->get_name().empty()) {
+        fprintf(fo, "{ \"error\": \"Invalid function name\" }");
+        return;
+    }
+
+    fprintf(fo, "{");
+    fprintf(fo, "\"id\":\"%p\",", (void*)f);
+    fprintf(fo, "\"name\":\"%s\",", f->get_name().c_str());
+    fprintf(fo, "\"children\":[");
+
+    safe_collect_children(fo, f, begin, end, type);
+
+    fprintf(fo, "]");
+    fprintf(fo, "}");
+}
+
+
+static bool is_valid_call_ptr(Call *candidate)
+{
+    if (!candidate)
+        return false;
+    for (auto it = Call::fbegin(); it != Call::fend(); ++it)
+        if (it->second == candidate)
+            return true;
+    return false;
+}
+
+static void collect_functions(
+    Call *f,
+    Call::const_fiterator_type (Call::*fbegin)() const,
+    Call::const_fiterator_type (Call::*fend)() const,
+    bool recurse,
+    int depth,
+    std::set<Call *> &visited,
+    FILE *of,
+    bool &first_child)
+{
+    if (depth <= 0)
+        return;
+
+    for (auto i = (f->*fbegin)(); i != (f->*fend)(); ++i) {
+        Call *child = *i;
+        if (!child) continue;   // safety guard
+
+        bool already_visited = visited.count(child) > 0;
+
+        if (!first_child) fprintf(of, ",");
+        first_child = false;
+
+        fprintf(of,
+            "{\"id\":\"%p\",\"name\":\"%s\","
+            "\"is_macro\":%s,\"is_file_scoped\":%s,"
+            "\"children\":[",
+            (void *)child,
+            child->get_name().c_str(),
+            child->is_macro()       ? "true" : "false",
+            child->is_file_scoped() ? "true" : "false"
+        );
+
+        if (recurse && !already_visited) {
+            visited.insert(child);
+            bool first_grandchild = true;
+            collect_functions(child, fbegin, fend, recurse, depth - 1,
+                              visited, of, first_grandchild);
+            visited.erase(child);
+        }
+
+        fprintf(of, "]}");
+    }
+}
+static int api_funlist(FILE *of, void *)
+{
+    fprintf(of,
+        "Content-Type: application/json\r\n"
+        "Access-Control-Allow-Origin: *\r\n\r\n");
+
+  
+    Call *f = nullptr;
+    if (!swill_getargs("p(f)", &f)) {
+        fprintf(of, "{\"error\":\"Missing param f\"}");
+        return 0;
+    }
+
+    
+    if (!is_valid_call_ptr(f)) {
+        fprintf(of,
+            "{\"error\":\"Invalid pointer f=%p — "
+            "must be an id value returned by /api/functions\"}",
+            (void *)f);
+        return 0;
+    }
+
+    
+    const char *n = swill_getvar("n");
+    if (!n || (*n != 'd' && *n != 'D' && *n != 'u' && *n != 'U')) {
+        fprintf(of,
+            "{\"error\":\"Missing/invalid n. "
+            "Use: d=direct callees, D=all callees, "
+            "u=direct callers, U=all callers\"}");
+        return 0;
+    }
+
+    bool is_callees = (*n == 'd' || *n == 'D');
+    bool recurse    = (*n == 'D' || *n == 'U');
+
+        int depth = Option::cgraph_depth->get();
+    const char *depth_str = swill_getvar("depth");
+    if (depth_str) {
+        int d = atoi(depth_str);
+        if (d > 0) depth = d;
+    }
+
+    Call::const_fiterator_type (Call::*fbegin)() const;
+    Call::const_fiterator_type (Call::*fend)()   const;
+    if (is_callees) {
+        fbegin = &Call::call_begin;
+        fend   = &Call::call_end;
+    } else {
+        fbegin = &Call::caller_begin;
+        fend   = &Call::caller_end;
+    }
+
+    // Step 6: emit JSON tree
+    fprintf(of,
+        "{\"id\":\"%p\",\"name\":\"%s\","
+        "\"direction\":\"%s\",\"children\":[",
+        (void *)f,
+        f->get_name().c_str(),
+        is_callees ? "callees" : "callers"
+    );
+
+    std::set<Call *> visited;
+    visited.insert(f);
+    bool first = true;
+    collect_functions(f, fbegin, fend, recurse, depth, visited, of, first);
+
+    fprintf(of, "]}");
+    return 0;
+}
+
+
+
+
+
 
 int
 main(int argc, char *argv[])
@@ -3726,6 +4516,16 @@ main(int argc, char *argv[])
 		// Identifier query and execution
 		swill_handle("iquery.html", iquery_page, NULL);
 		swill_handle("xiquery.html", xiquery_page, NULL);
+		swill_handle("api/identifiers", api_identifiers, NULL);
+		swill_handle("/api/identifier", api_identifier_detail, NULL);
+		//swill_handle("/api/identifier/functions", api_identifier_functions, NULL);
+		swill_handle("/api/identifier/locations", api_identifier_locations, NULL);
+		swill_handle("api/files", api_files_handler, NULL);
+		//swill_handle("api/file/functions", api_file_functions, NULL);
+		swill_handle("api/file/includes", api_file_includes, NULL);
+		swill_handle("api/file/dependencies", api_file_dependencies, NULL);
+		swill_handle("/api/functions", api_functions, NULL);
+		swill_handle("/api/funlist", api_funlist, NULL);
 		// File query and execution
 		swill_handle("filequery.html", filequery_page, NULL);
 		swill_handle("xfilequery.html", xfilequery_page, NULL);
